@@ -1,0 +1,10 @@
+# Azure SDKs for the demo scripts
+azure-storage-queue>=12.11.0
+azure-servicebus>=7.12.0
+azure-eventhub>=5.12.0
+azure-eventhub-checkpointstoreblob>=1.1.4
+azure-eventgrid>=4.20.0
+azure-identity>=1.19.0
+
+# Convenience
+python-dotenv>=1.0.1
