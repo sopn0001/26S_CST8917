@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from azure.identity import DefaultAzureCredential
 from azure.storage.queue import QueueClient
 
 from shared import log
@@ -26,25 +27,21 @@ def main(count: int) -> None:
         f"queue: {settings.receipt_queue}   ·   sending {count} receipt jobs",
     )
 
-    client = QueueClient.from_connection_string(
-        settings.storage_conn, settings.receipt_queue
+    # Sign in with your local Azure identity (az login). No keys in code.
+    # exclude_managed_identity_credential keeps it on your az-login user,
+    # not the VM's managed identity.
+    client = QueueClient(
+        account_url=settings.storage_account_url,
+        queue_name=settings.receipt_queue,
+        credential=DefaultAzureCredential(exclude_managed_identity_credential=True),
     )
-    # create_queue is idempotent-ish: it raises if the queue already exists.
-    try:
-        client.create_queue()
-        log.info(f"created queue '{settings.receipt_queue}'")
-    except Exception:
-        log.info(f"queue '{settings.receipt_queue}' already exists")
 
+    # Put each order on the queue. That's the whole producer.
     for _ in range(count):
         order = Order.random()
-        # 64 KB limit. If your payload is bigger, use the claim-check pattern:
-        # put the blob in storage and send the URI instead.
         client.send_message(order.to_json())
         log.sent(f"{order.order_id}  {order.item:<9} ${order.amount:>6.2f}")
 
-    props = client.get_queue_properties()
-    log.info(f"approximate queue depth is now {props.approximate_message_count}")
     print()
     log.info("Now run:  python 01_storage_queue/consumer.py")
 

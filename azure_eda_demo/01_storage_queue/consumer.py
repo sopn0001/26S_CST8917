@@ -1,118 +1,72 @@
-"""DEMO 1b — Storage Queues: receive, and the visibility timeout.
+"""DEMO 1b — Storage Queues: the visibility timeout and lease renewal.
 
-THE POINT OF THIS SCRIPT
-------------------------
-Receiving does NOT remove the message. It hides it for `visibility_timeout`
-seconds and hands you a pop receipt. Only `delete_message` removes it.
+A message you receive is hidden for `visibility_timeout` seconds, not removed.
+If your work runs longer than that window, the message reappears and another
+consumer grabs it — now it runs twice. The fix is to renew the lease: call
+`update_message` with a fresh visibility timeout before the current one expires.
 
-So:
-    * finish and delete   -> message is gone
-    * crash before delete -> message reappears and someone else gets it
-
-That is at-least-once delivery, and it is why every handler must be idempotent.
-
-TRY THIS DURING THE DEMO
-------------------------
-1. python 01_storage_queue/producer.py --count 5
-2. python 01_storage_queue/consumer.py --slow
-3. Hit Ctrl-C while a message is "in flight"
-4. Wait for the timeout, run the consumer again — the message is back,
-   with dequeue_count incremented.
+    peek    — look at the next message without dequeuing it
+    receive — dequeue it, hidden for 10s, with a pop receipt
+    process — pretend to work for 9s (nearly the whole window)
+    update  — renew the lease for another 10s so it never reappears
+    delete  — remove it for good
 
 Run:
+    python 01_storage_queue/producer.py --count 1
     python 01_storage_queue/consumer.py
-    python 01_storage_queue/consumer.py --slow --visibility 15
 """
-import argparse
-import json
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from azure.identity import DefaultAzureCredential
 from azure.storage.queue import QueueClient
 
 from shared import log
 from shared.config import settings
 
-# Storage Queues have no built-in dead-letter queue. You enforce a poison
-# threshold yourself by watching dequeue_count.
-MAX_DEQUEUE_COUNT = 3
 
-
-def handle(order: dict, slow: bool) -> None:
-    """Pretend to generate a PDF receipt."""
-    if slow:
-        time.sleep(6)
-    if order.get("item") == "poutine":
-        # A deliberate poison message so you can watch dequeue_count climb.
-        raise RuntimeError("receipt template for 'poutine' is broken")
-
-
-def main(visibility: int, slow: bool) -> None:
+def main() -> None:
     log.banner(
-        "Storage Queues — consumer",
-        f"queue: {settings.receipt_queue}   ·   visibility_timeout={visibility}s",
+        "Storage Queues — visibility timeout & lease renewal",
+        f"queue: {settings.receipt_queue}",
     )
 
-    client = QueueClient.from_connection_string(
-        settings.storage_conn, settings.receipt_queue
+    credential = DefaultAzureCredential(exclude_managed_identity_credential=True)
+    client = QueueClient(
+        account_url=settings.storage_account_url,
+        queue_name=settings.receipt_queue,
+        credential=credential,
     )
 
-    empty_polls = 0
-    while empty_polls < 3:
-        batch = client.receive_messages(
-            messages_per_page=5,
-            visibility_timeout=visibility,
-        )
-        got_any = False
+    # 1. PEEK — look at the next message. It stays visible for others.
+    peeked = client.peek_messages()
+    if not peeked:
+        log.info("queue is empty — run the producer first")
+        return
+    log.info(f"peeked:   {peeked[0].content}")
 
-        for msg in batch:
-            got_any = True
-            order = json.loads(msg.content)
-            log.received(
-                f"{order['order_id']}  attempt #{msg.dequeue_count}  "
-                f"(hidden for {visibility}s)"
-            )
+    # 2. RECEIVE — dequeue it. Hidden from other consumers for 10 seconds.
+    msg = client.receive_message(visibility_timeout=10)
+    log.received(f"received: {msg.content}  (hidden for 10s)")
 
-            if msg.dequeue_count > MAX_DEQUEUE_COUNT:
-                # Manual poison handling. Service Bus does this for you.
-                log.dead(
-                    f"{order['order_id']} exceeded {MAX_DEQUEUE_COUNT} attempts "
-                    f"— moving aside and deleting"
-                )
-                # In real code: copy to a 'receipts-poison' queue first.
-                client.delete_message(msg)
-                continue
+    # 3. PROCESS — pretend the work takes 9s, almost the whole 10s window.
+    log.info("processing… (9s, nearly the whole visibility window)")
+    time.sleep(9)
 
-            try:
-                handle(order, slow)
-            except Exception as exc:
-                # No delete -> the message becomes visible again automatically.
-                log.fail(f"{order['order_id']} {exc} — will reappear in {visibility}s")
-                continue
+    # 4. UPDATE — renew the lease for another 10s before it expires, so the
+    #    message never reappears for a competing consumer.
+    msg = client.update_message(msg, visibility_timeout=10)
+    log.info("lease renewed: hidden for another 10s")
+    time.sleep(1)  # a little more work under the renewed lease
 
-            # The pop receipt proves we still hold the lock. If our visibility
-            # timeout already expired, this call fails — and that is correct,
-            # because someone else owns the message now.
-            client.delete_message(msg)
-            log.done(f"{order['order_id']} receipt generated and deleted")
-
-        if not got_any:
-            empty_polls += 1
-            log.info("queue empty, polling…")
-            time.sleep(2)
-
-    print()
-    log.info("Three empty polls in a row — stopping.")
+    # 5. DELETE — work is done, remove it for good.
+    client.delete_message(msg)
+    log.done("deleted")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--visibility", type=int, default=15)
-    parser.add_argument(
-        "--slow", action="store_true", help="sleep 6s per message so you can Ctrl-C mid-flight"
-    )
-    args = parser.parse_args()
-    main(args.visibility, args.slow)
+    main()
+

@@ -1,6 +1,6 @@
 # Event-Driven Architecture on Azure — demo repo
 
-Companion code for the two-hour workshop. Five runnable demos covering Azure
+Five runnable demos covering Azure
 Storage Queues, Service Bus, Event Hubs and Event Grid, plus the same workload
 rewritten as Azure Functions.
 
@@ -57,21 +57,32 @@ RG=rg-eda-demo bash infra/cleanup.sh
 
 Each demo is standalone and prints what it is doing. Roughly five minutes each.
 
-### 1. Storage Queues — the visibility timeout
+### 1. Storage Queues — the visibility timeout & lease renewal
 
 ```bash
 python 01_storage_queue/producer.py --count 5
-python 01_storage_queue/consumer.py --slow
+python 01_storage_queue/consumer.py
 ```
 
-**Break it on purpose:** hit `Ctrl-C` while a message is in flight, wait for the
-timeout, run the consumer again. The message is back with `dequeue_count`
-incremented. That is at-least-once delivery, and it is why every handler in
-this repo is idempotent.
+The producer is its own process — it just puts orders on the queue, exactly as a
+separate service would in production.
 
-Also watch the `poutine` orders — they fail deliberately, so you can see manual
-poison-message handling. Storage Queues have no dead-letter queue; you enforce
-the threshold yourself.
+The consumer walks one message through its full lifecycle:
+
+1. **peek** — look at the next message without dequeuing it.
+2. **receive** — dequeue it with a 10-second visibility timeout; the message is
+   now hidden from other consumers, and you hold a pop receipt.
+3. **process** — pretend to work for 9 seconds, nearly the whole window.
+4. **update** — renew the lease for another 10 seconds *before* it expires, so a
+   competing consumer never sees the message and it isn't processed twice.
+5. **delete** — the only call that actually removes the message.
+
+**The point:** receiving does not remove a message, it hides it. If your work
+outlasts the visibility timeout, the message reappears and someone else picks it
+up — that is at-least-once delivery, and why every handler must be idempotent.
+`update_message` with a fresh timeout is how a long-running handler keeps its
+lease. Storage Queues have no dead-letter queue; you enforce any poison
+threshold yourself by watching `dequeue_count`.
 
 ### 2. Service Bus — peek-lock, retries, dead lettering
 
@@ -203,7 +214,7 @@ The hub here has 4.
 
 ```
 shared/            config, domain models, console logging, idempotency store
-01_storage_queue/  producer + consumer, visibility timeout, poison handling
+01_storage_queue/  producer + consumer, visibility timeout, lease renewal
 02_service_bus/    send, peek-lock receive, DLQ inspect/replay, topic fan-out
 03_event_hubs/     partitioned producer, checkpointing consumer, replay
 04_event_grid/     custom topic publisher (EventGrid + CloudEvents schemas)
@@ -213,17 +224,25 @@ infra/             provision.sh, cleanup.sh
 
 ## A note on credentials
 
-These scripts use connection strings because that keeps the classroom setup to
-one command. Production uses managed identity:
+The Storage Queue scripts use `DefaultAzureCredential`, the same passwordless
+approach recommended by the Azure quickstart. Sign in once with `az login` and
+the signed-in identity is used automatically — no keys in code or `.env`:
 
 ```python
 from azure.identity import DefaultAzureCredential
 
-client = ServiceBusClient(
-    fully_qualified_namespace="sb-yourns.servicebus.windows.net",
-    credential=DefaultAzureCredential(),
+client = QueueClient(
+    account_url="https://<account>.queue.core.windows.net",
+    queue_name="receipts",
+    credential=DefaultAzureCredential(exclude_managed_identity_credential=True),
 )
 ```
 
-Every SDK in this repo accepts a `credential=` in place of a connection string.
-`.env` and `local.settings.json` are gitignored — keep it that way.
+The identity needs the **Storage Queue Data Contributor** role on the storage
+account; newly assigned roles can take a few minutes to propagate. On an Azure
+VM, `exclude_managed_identity_credential=True` keeps auth on your `az login`
+user instead of the VM's managed identity.
+
+The Service Bus and Event Hubs scripts still use connection strings to keep the
+classroom setup to one command, but every SDK here accepts a `credential=` in
+its place. `.env` and `local.settings.json` are gitignored — keep it that way.

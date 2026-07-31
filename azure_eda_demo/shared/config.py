@@ -32,6 +32,10 @@ class Settings:
     def storage_conn(self) -> str:
         return _require("STORAGE_CONNECTION_STRING")
 
+    @property
+    def storage_account_url(self) -> str:
+        return _require("STORAGE_ACCOUNT_URL")
+
     receipt_queue = os.getenv("RECEIPT_QUEUE", "receipts")
     checkpoint_container = os.getenv("CHECKPOINT_CONTAINER", "checkpoints")
 
