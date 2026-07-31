@@ -1,19 +1,15 @@
 # Event-Driven Architecture on Azure — demo repo
 
-Five runnable demos covering Azure
-Storage Queues, Service Bus, Event Hubs and Event Grid, plus the same workload
-rewritten as Azure Functions.
+Three runnable demos covering Azure Storage Queues, Service Bus and Event Hubs.
 
-The scenario is a campus food-ordering system. It deliberately uses all four
-services at once, because each flow has different requirements:
+The scenario is a campus food-ordering system. It uses three services at once,
+because each flow has different requirements:
 
 | Flow | Requirement | Service |
 |---|---|---|
-| Place an order | Must not be lost. Retries, DLQ. | Service Bus queue |
-| Broadcast order status | Two teams need their own copy | Service Bus topic |
-| Fryer telemetry | Very high volume, replayable | Event Hubs |
+| Place an order | Must not be lost. Locked while processed. | Service Bus queue |
+| Fryer telemetry | Very high volume, append-only log | Event Hubs |
 | Generate receipts | Cheap background work | Storage Queue |
-| Menu file uploaded | Discrete reaction, push | Event Grid |
 
 ---
 
@@ -27,10 +23,10 @@ az login
 bash infra/provision.sh
 ```
 
-This creates a resource group, storage account, Service Bus namespace with a
-queue/topic/two subscriptions, an Event Hubs namespace with 4 partitions and
-three consumer groups, and an Event Grid custom topic — then writes a filled-in
-`.env` for you.
+This creates a resource group, a storage account with a receipt queue, a
+Service Bus namespace with an `orders` queue, and an Event Hubs namespace with
+a 4-partition `telemetry` hub. It disables SAS auth on the namespaces, assigns
+your signed-in user the data roles it needs, and writes a ready-to-use `.env`.
 
 **2. Install the SDKs**
 
@@ -55,7 +51,7 @@ RG=rg-eda-demo bash infra/cleanup.sh
 
 ## Run order
 
-Each demo is standalone and prints what it is doing. Roughly five minutes each.
+Each demo is standalone and prints what it is doing.
 
 ### 1. Storage Queues — the visibility timeout & lease renewal
 
@@ -84,109 +80,62 @@ up — that is at-least-once delivery, and why every handler must be idempotent.
 lease. Storage Queues have no dead-letter queue; you enforce any poison
 threshold yourself by watching `dequeue_count`.
 
-### 2. Service Bus — peek-lock, retries, dead lettering
+### 2. Service Bus — peek-lock & lock renewal
 
 ```bash
-python 02_service_bus/send_orders.py --count 8
+python 02_service_bus/send_orders.py --count 5
 python 02_service_bus/receive_peek_lock.py
-python 02_service_bus/inspect_dlq.py
-python 02_service_bus/inspect_dlq.py --replay
 ```
 
-The `ramen` orders fail every time. Watch `delivery_count` climb, then watch
-them land in the DLQ with a reason and description attached.
+The sender just puts orders on the queue. The receiver walks one message
+through peek-lock:
 
-Competing consumers — add workers, and the same queue distributes across them:
+1. **peek** — look at the next message without locking it.
+2. **receive** — lock it (peek-lock); it is hidden from other consumers.
+3. **process** — pretend to work for 9 seconds.
+4. **renew** — `renew_message_lock` before the lock expires, so the message
+   never reappears for a competing consumer.
+5. **complete** — the call that removes the message.
 
-```bash
-python 02_service_bus/send_orders.py --count 30
-python 02_service_bus/receive_peek_lock.py --workers 3
-```
+**The point:** this is the same lifecycle as the Storage Queue demo, but the
+broker manages the lock instead of a visibility timeout. If you never complete a
+message, the lock expires and Service Bus redelivers it — at-least-once again.
 
-### 3. Service Bus topics — fan-out with broker-side filters
+### 3. Event Hubs — a partitioned, append-only log
 
-Three terminals:
-
-```bash
-python 02_service_bus/topic_fanout.py --listen notify    # terminal 1
-python 02_service_bus/topic_fanout.py --listen audit     # terminal 2
-python 02_service_bus/topic_fanout.py --publish          # terminal 3
-```
-
-`notify` receives everything. `audit` has a SQL filter (`amount > 13`) and only
-ever sees the large orders. The filter runs inside the broker — the small
-orders are never delivered to `audit` at all.
-
-### 4. Event Hubs — partitions, consumer groups, replay
+This is a live tail. Start the consumer first and wait for **"reader
+attached"** (authenticating and connecting takes a few seconds), then run the
+producer in another terminal and watch the events arrive. Ctrl-C to stop.
 
 ```bash
-python 03_event_hubs/telemetry_producer.py --count 5000
+# Terminal 1
 python 03_event_hubs/telemetry_consumer.py
+
+# Terminal 2 (after "reader attached")
+python 03_event_hubs/telemetry_producer.py --count 10
 ```
 
-Then the thing a queue cannot do:
-
-```bash
-python 03_event_hubs/telemetry_consumer.py --from-start
-python 03_event_hubs/telemetry_consumer.py --group archive --from-start
-```
-
-Reading does not remove anything. Three consumer groups can read the same
-stream at three different speeds with independent bookmarks.
-
-Compare ordering behaviour with and without a partition key:
-
-```bash
-python 03_event_hubs/telemetry_producer.py --count 2000 --no-key
-```
-
-### 5. Event Grid — push delivery
-
-```bash
-python 04_event_grid/publish_events.py
-python 04_event_grid/publish_events.py --schema cloudevent
-```
-
-There is no consumer to run — Event Grid pushes to whatever subscribed. Wire up
-a subscription to the Functions app below, then break the handler and watch the
-retries and the dead-letter blob.
-
-### 6. The same thing as Azure Functions
-
-```bash
-cd 05_functions
-cp local.settings.json.example local.settings.json   # fill in connections
-func start
-```
-
-All four trigger types in one `function_app.py` (Python v2 model). The host
-handles the receive loop, lock renewal and checkpointing. What you still own is
-idempotency and deciding what a failure means — which is the point.
+**The point:** Event Hubs is not a queue. Sending appends to the end of a
+partition; reading does not remove anything. Any number of consumer groups can
+read the same stream at their own pace with independent bookmarks.
 
 ---
 
-## The five things worth arguing about
+## The things worth arguing about
 
 **1. Message or event?** A message is sent with intent to one logical handler
 ("charge this card"). An event is a broadcast fact ("payment was taken"). Get
 this right and the service choice is nearly mechanical.
 
 **2. At-least-once is what you actually get.** Not at-most-once, not
-exactly-once. Every consumer here has an idempotency guard, and every one of
-them needs it. In production that guard is a unique constraint in the same
+exactly-once. Both queue consumers here can see a redelivery, so the handler
+must be idempotent. In production that guard is a unique constraint in the same
 transaction as the business change — not an in-memory set.
 
-**3. Ordering is opt-in and it costs you.** Service Bus sessions and Event Hubs
-partition keys both give ordering *per key*. Global ordering means one partition
-and one consumer, which means you have thrown away the architecture. Ask whether
-the requirement really means "per customer" — it usually does.
-
-**4. The dead-letter queue needs an owner.** A DLQ with no alert is silent data
-loss. Alert on `DeadletteredMessages > 0`, log the reason and description, and
-build the replay tool before 2am rather than during it.
-
-**5. Design the failure path first.** Retries, poison thresholds, compensating
-actions and dead letters are the architecture. The happy path is the easy part.
+**3. Ordering is opt-in and it costs you.** Event Hubs partition keys give
+ordering *per key*. Global ordering means one partition and one consumer, which
+means you have thrown away the architecture. Ask whether the requirement really
+means "per customer" — it usually does.
 
 ---
 
@@ -195,18 +144,14 @@ actions and dead letters are the architecture. The happy path is the easy part.
 **`Missing environment variable: ...`** — `.env` was not found or is empty.
 Run `infra/provision.sh`, or copy `.env.example` to `.env` and fill it in.
 
-**`ServiceBusAuthorizationError`** — the connection string is namespace-level
-but the queue or topic does not exist. Re-run the provisioning script.
+**`Unauthorized` / `amqp:unauthorized-access` / `AuthorizationFailure`** — your
+signed-in identity is missing a data role, or the role was just assigned and is
+still propagating (allow a few minutes). The namespaces have SAS auth disabled,
+so a connection string will not work — you must be signed in with `az login`.
 
-**Event Hubs consumer reads nothing** — you are at `@latest` and nothing new is
-arriving. Run the producer in another terminal, or pass `--from-start`.
-
-**Event Hubs consumer reads nothing the second time** — working as intended.
-Your checkpoint is at the end of the stream. Pass `--from-start` to rewind.
-
-**Scaling the consumer changes nothing** — you have more instances than
-partitions. One active reader per partition per consumer group is the ceiling.
-The hub here has 4.
+**Event Hubs consumer reads nothing** — start the consumer *first* and wait for
+"reader attached" before running the producer. Its read position is anchored to
+the moment it started, so events produced before it launched are not shown.
 
 ---
 
@@ -215,18 +160,16 @@ The hub here has 4.
 ```
 shared/            config, domain models, console logging, idempotency store
 01_storage_queue/  producer + consumer, visibility timeout, lease renewal
-02_service_bus/    send, peek-lock receive, DLQ inspect/replay, topic fan-out
-03_event_hubs/     partitioned producer, checkpointing consumer, replay
-04_event_grid/     custom topic publisher (EventGrid + CloudEvents schemas)
-05_functions/      all four triggers, Python v2 programming model
-infra/             provision.sh, cleanup.sh
+02_service_bus/    send + peek-lock receive, lock renewal
+03_event_hubs/     producer + live-tail consumer
+infra/             provision + cleanup (bash and PowerShell)
 ```
 
 ## A note on credentials
 
-The Storage Queue scripts use `DefaultAzureCredential`, the same passwordless
-approach recommended by the Azure quickstart. Sign in once with `az login` and
-the signed-in identity is used automatically — no keys in code or `.env`:
+Every script uses `DefaultAzureCredential`, the passwordless approach
+recommended by the Azure quickstarts. Sign in once with `az login` and the
+signed-in identity is used automatically — no keys in code or `.env`:
 
 ```python
 from azure.identity import DefaultAzureCredential
@@ -238,11 +181,9 @@ client = QueueClient(
 )
 ```
 
-The identity needs the **Storage Queue Data Contributor** role on the storage
-account; newly assigned roles can take a few minutes to propagate. On an Azure
-VM, `exclude_managed_identity_credential=True` keeps auth on your `az login`
-user instead of the VM's managed identity.
-
-The Service Bus and Event Hubs scripts still use connection strings to keep the
-classroom setup to one command, but every SDK here accepts a `credential=` in
-its place. `.env` and `local.settings.json` are gitignored — keep it that way.
+`provision.sh` assigns the signed-in user **Storage Queue Data Contributor** on
+the storage account, **Azure Service Bus Data Owner** on the Service Bus
+namespace, and **Azure Event Hubs Data Owner** on the Event Hubs namespace.
+Newly assigned roles can take a few minutes to propagate. On an Azure VM,
+`exclude_managed_identity_credential=True` keeps auth on your `az login` user
+instead of the VM's managed identity. `.env` is gitignored — keep it that way.

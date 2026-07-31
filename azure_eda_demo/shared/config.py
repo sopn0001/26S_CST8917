@@ -27,45 +27,27 @@ def _require(name: str) -> str:
 
 
 class Settings:
-    # ---- Storage (queues + Event Hubs checkpoints + Event Grid dead letters) ----
-    @property
-    def storage_conn(self) -> str:
-        return _require("STORAGE_CONNECTION_STRING")
-
+    # ---- Storage Queues ----
     @property
     def storage_account_url(self) -> str:
         return _require("STORAGE_ACCOUNT_URL")
 
     receipt_queue = os.getenv("RECEIPT_QUEUE", "receipts")
-    checkpoint_container = os.getenv("CHECKPOINT_CONTAINER", "checkpoints")
 
     # ---- Service Bus ----
     @property
-    def servicebus_conn(self) -> str:
-        return _require("SERVICEBUS_CONNECTION_STRING")
+    def servicebus_namespace(self) -> str:
+        return _require("SERVICEBUS_NAMESPACE")
 
     order_queue = os.getenv("ORDER_QUEUE", "orders")
-    session_queue = os.getenv("SESSION_QUEUE", "orders-sessions")
-    status_topic = os.getenv("STATUS_TOPIC", "order-status")
-    notify_subscription = os.getenv("NOTIFY_SUBSCRIPTION", "notify")
-    audit_subscription = os.getenv("AUDIT_SUBSCRIPTION", "audit")
 
     # ---- Event Hubs ----
     @property
-    def eventhub_conn(self) -> str:
-        return _require("EVENTHUB_CONNECTION_STRING")
+    def eventhub_namespace(self) -> str:
+        return _require("EVENTHUB_NAMESPACE")
 
     eventhub_name = os.getenv("EVENTHUB_NAME", "telemetry")
     consumer_group = os.getenv("EVENTHUB_CONSUMER_GROUP", "$Default")
-
-    # ---- Event Grid ----
-    @property
-    def eventgrid_endpoint(self) -> str:
-        return _require("EVENTGRID_TOPIC_ENDPOINT")
-
-    @property
-    def eventgrid_key(self) -> str:
-        return _require("EVENTGRID_TOPIC_KEY")
 
 
 settings = Settings()

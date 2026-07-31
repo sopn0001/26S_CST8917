@@ -1,137 +1,80 @@
-"""DEMO 2b — Service Bus: peek-lock and the three ways a message ends.
+"""DEMO 2b — Service Bus: peek-lock and lock renewal.
 
-THE THREE ENDINGS
------------------
-    complete_message()      done. Removed from the queue.
-    abandon_message()       give up the lock immediately, redeliver now.
-                            delivery_count increments.
-    dead_letter_message()   stop trying. Move to the DLQ with a reason.
+Receiving in peek-lock mode does NOT remove the message — it locks it for
+`lock_duration` seconds (30s by default). If your work runs longer than that
+window, the lock expires and the broker redelivers the message to another
+consumer — now it runs twice. The fix is to renew the lock: call
+`renew_message_lock` before the current lock expires.
 
-If you do none of these, the lock expires and the broker redelivers anyway.
-Service Bus counts deliveries for you: past MaxDeliveryCount (default 10) it
-dead-letters automatically. Storage Queues make you do that yourself.
-
-WATCH FOR
----------
-* delivery_count climbing on the 'ramen' orders (they fail on purpose)
-* the SKIPPED lines — that is idempotency working on a redelivered message
-* run 02_service_bus/inspect_dlq.py afterwards
+    peek     — look at the next message without locking it
+    receive  — lock it, hidden from other consumers, with a lock token
+    process  — pretend to work for 9s
+    renew    — renew the lock so it never reappears
+    complete — remove it for good
 
 Run:
+    python 02_service_bus/send_orders.py --count 1
     python 02_service_bus/receive_peek_lock.py
-    python 02_service_bus/receive_peek_lock.py --workers 3     # competing consumers
 """
-import argparse
-import json
-import random
 import sys
-import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from azure.identity import DefaultAzureCredential
 from azure.servicebus import ServiceBusClient
-from azure.servicebus.exceptions import MessageLockLostError
 
 from shared import log
 from shared.config import settings
 
-# Shared across the worker threads: the same guard a real consumer needs.
-SEEN = log.SeenStore()
-SEEN_LOCK = threading.Lock()
 
-POISON_ITEM = "ramen"
+def main() -> None:
+    log.banner(
+        "Service Bus — peek-lock & lock renewal",
+        f"queue: {settings.order_queue}",
+    )
 
+    # Sign in with your local Azure identity (az login). No keys in code —
+    # the namespace has local (SAS) auth disabled, so Azure AD is required.
+    client = ServiceBusClient(
+        fully_qualified_namespace=settings.servicebus_namespace,
+        credential=DefaultAzureCredential(exclude_managed_identity_credential=True),
+    )
+    with client:
+        # 1. PEEK — look at the next message. It stays available for others.
+        with client.get_queue_receiver(settings.order_queue) as peeker:
+            peeked = peeker.peek_messages(max_message_count=1)
+            if not peeked:
+                log.info("queue is empty — run the producer first")
+                return
+            log.info(f"peeked:   {str(peeked[0])}")
 
-def process(order: dict) -> None:
-    """Business logic. Fails deterministically for one item."""
-    time.sleep(random.uniform(0.2, 0.6))
-    if order["item"] == POISON_ITEM:
-        raise RuntimeError("kitchen printer for the wok station is offline")
-
-
-def worker(name: str, deadline: float) -> None:
-    with ServiceBusClient.from_connection_string(settings.servicebus_conn) as client:
-        # max_wait_time makes the iterator stop instead of blocking forever.
+        # 2. RECEIVE — lock it. Hidden from other consumers until we complete.
         with client.get_queue_receiver(
             settings.order_queue, max_wait_time=5
         ) as receiver:
-            for msg in receiver:
-                if time.time() > deadline:
-                    break
+            msgs = receiver.receive_messages(max_message_count=1, max_wait_time=5)
+            if not msgs:
+                log.info("nothing to receive right now")
+                return
+            msg = msgs[0]
+            log.received(f"received: {str(msg)}  (locked)")
 
-                order = json.loads(str(msg))
-                key = msg.message_id or order["order_id"]
+            # 3. PROCESS — pretend the work takes 9s.
+            log.info("processing… (9s of work under the lock)")
+            time.sleep(9)
 
-                log.received(
-                    f"[{name}] {order['order_id']}  delivery #{msg.delivery_count + 1}  "
-                    f"trace={msg.correlation_id}"
-                )
+            # 4. RENEW — renew the lock before it expires, so the message
+            #    never reappears for a competing consumer.
+            receiver.renew_message_lock(msg)
+            log.info("lock renewed")
+            time.sleep(1)  # a little more work under the renewed lock
 
-                # ---- idempotency guard -------------------------------------
-                # At-least-once delivery means we WILL see repeats. Doing the
-                # work twice must be indistinguishable from doing it once.
-                with SEEN_LOCK:
-                    if SEEN.already_processed(key):
-                        log.skip(f"[{name}] {key} already processed — completing without redoing work")
-                        receiver.complete_message(msg)
-                        continue
-
-                # ---- do the work -------------------------------------------
-                try:
-                    process(order)
-                except Exception as exc:
-                    if msg.delivery_count >= 4:
-                        # We know it will never succeed. Stop burning retries.
-                        receiver.dead_letter_message(
-                            msg,
-                            reason="UnprocessableOrder",
-                            error_description=str(exc),
-                        )
-                        log.dead(f"[{name}] {order['order_id']} -> DLQ: {exc}")
-                    else:
-                        receiver.abandon_message(msg)
-                        log.fail(f"[{name}] {order['order_id']} {exc} — abandoned, will retry")
-                    continue
-
-                # ---- commit ------------------------------------------------
-                try:
-                    receiver.complete_message(msg)
-                except MessageLockLostError:
-                    # The work took longer than the lock. The message is being
-                    # redelivered right now — our idempotency guard covers it.
-                    log.warn(f"[{name}] lock lost on {order['order_id']} — redelivery expected")
-                    continue
-
-                with SEEN_LOCK:
-                    SEEN.mark(key)
-                log.done(f"[{name}] {order['order_id']} sent to the {order['station']} station")
-
-
-def main(workers: int, seconds: int) -> None:
-    log.banner(
-        "Service Bus — peek-lock receiver",
-        f"queue: {settings.order_queue}   ·   {workers} competing consumer(s)   ·   {seconds}s",
-    )
-    deadline = time.time() + seconds
-
-    threads = [
-        threading.Thread(target=worker, args=(f"w{i + 1}", deadline), daemon=True)
-        for i in range(workers)
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    print()
-    log.info("Done. Check the dead-letter queue: python 02_service_bus/inspect_dlq.py")
+            # 5. COMPLETE — work is done, remove it for good.
+            receiver.complete_message(msg)
+            log.done("completed")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--workers", type=int, default=1, help="competing consumers")
-    parser.add_argument("--seconds", type=int, default=45)
-    args = parser.parse_args()
-    main(args.workers, args.seconds)
+    main()
